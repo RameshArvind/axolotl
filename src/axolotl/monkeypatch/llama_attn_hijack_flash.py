@@ -78,6 +78,33 @@ def replace_llama_qkv_with_fused(model):
             set_module_name(model, name, qkv)
 
 
+def patch_llama_cross_entropy():
+    from flash_attn.losses.cross_entropy import CrossEntropyLoss
+
+    LOG.info("patching with flash_attn.losses.cross_entropy")
+    transformers.models.llama.modeling_llama.CrossEntropyLoss = partial(
+        CrossEntropyLoss, inplace_backward=True
+    )
+
+
+def patch_llama_rms_norm():
+    try:
+        from flash_attn.ops.rms_norm import RMSNorm
+
+        class LlamaRMSNorm(RMSNorm):
+            """Patched LLamaRMSNorm"""
+
+            def __init__(self, hidden_size, eps=1e-6):
+                super().__init__(hidden_size, eps=eps)
+
+        LOG.info("patching with flash_attn.ops.rms_norm")
+        transformers.models.llama.modeling_llama.LlamaRMSNorm = LlamaRMSNorm
+    except ImportError:
+        LOG.warning(
+            "optimized flash-attention RMSNorm not found (run `pip install 'git+https://github.com/Dao-AILab/flash-attention.git#egg=dropout_layer_norm&subdirectory=csrc/layer_norm'`)"
+        )
+
+
 def replace_llama_attn_with_flash_attn(
     packed: Optional[bool] = False,
     cross_entropy: Optional[bool] = False,
@@ -104,35 +131,11 @@ def replace_llama_attn_with_flash_attn(
 
     # skip only if explicitly disabled
     if cross_entropy:
-        try:
-            from flash_attn.losses.cross_entropy import CrossEntropyLoss
-
-            LOG.info("patching with flash_attn.losses.cross_entropy")
-            transformers.models.llama.modeling_llama.CrossEntropyLoss = partial(
-                CrossEntropyLoss, inplace_backward=True
-            )
-        except ImportError:
-            LOG.info(
-                "optimized flash-attention CrossEntropyLoss not found (run `pip install 'git+https://github.com/Dao-AILab/flash-attention.git#egg=xentropy_cuda_lib&subdirectory=csrc/xentropy'`)"
-            )
+        patch_llama_cross_entropy()
 
     # skip only if explicitly disabled
     if rms_norm:
-        try:
-            from flash_attn.ops.rms_norm import RMSNorm
-
-            class LlamaRMSNorm(RMSNorm):
-                """Patched LLamaRMSNorm"""
-
-                def __init__(self, hidden_size, eps=1e-6):
-                    super().__init__(hidden_size, eps=eps)
-
-            LOG.info("patching with flash_attn.ops.rms_norm")
-            transformers.models.llama.modeling_llama.LlamaRMSNorm = LlamaRMSNorm
-        except ImportError:
-            LOG.info(
-                "optimized flash-attention RMSNorm not found (run `pip install 'git+https://github.com/Dao-AILab/flash-attention.git#egg=dropout_layer_norm&subdirectory=csrc/layer_norm'`)"
-            )
+        patch_llama_rms_norm()
 
 
 class FusedAttention(LlamaAttention):
@@ -284,12 +287,7 @@ def flashattn_forward_with_s2attn(
     # [bsz, nh, q_len, hd]
     # pylint: disable=duplicate-code
 
-    kv_seq_len = key_states.shape[-2]
-    if past_key_value is not None:
-        kv_seq_len += past_key_value[0].shape[-2]
-    cos, sin = self.rotary_emb(
-        value_states, seq_len=kv_seq_len, position_ids=position_ids
-    )
+    cos, sin = self.rotary_emb(value_states, position_ids=position_ids)
     query_states, key_states = apply_rotary_pos_emb(
         query_states, key_states, cos, sin, position_ids
     )
@@ -435,13 +433,7 @@ def flashattn_forward(
     # [bsz, q_len, nh, hd]
     # [bsz, nh, q_len, hd]
 
-    kv_seq_len = key_states.shape[-2]
-    if past_key_value is not None:
-        kv_seq_len += past_key_value[0].shape[-2]
-
-    cos, sin = self.rotary_emb(
-        value_states, seq_len=kv_seq_len, position_ids=position_ids
-    )
+    cos, sin = self.rotary_emb(value_states, position_ids=position_ids)
     query_states, key_states = apply_rotary_pos_emb(
         query_states, key_states, cos, sin, position_ids
     )
@@ -837,7 +829,6 @@ def llama_model_forward(
                 past_key_value=past_key_value,
                 output_attentions=output_attentions,
                 use_cache=use_cache,
-                padding_mask=padding_mask,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
             )

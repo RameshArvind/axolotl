@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
+import traceback
 from shutil import copyfile
 from tempfile import NamedTemporaryFile
-from typing import TYPE_CHECKING, Dict, List
+from typing import TYPE_CHECKING, Any, Dict, List
 
 import evaluate
 import numpy as np
@@ -27,7 +29,10 @@ from transformers import (
 )
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR, IntervalStrategy
 
+from axolotl.utils import is_mlflow_available
 from axolotl.utils.bench import log_gpu_memory_usage
+from axolotl.utils.callbacks.perplexity import Perplexity
+from axolotl.utils.config.models.input.v0_4_1 import AxolotlInputConfig
 from axolotl.utils.distributed import (
     barrier,
     broadcast_dict,
@@ -371,10 +376,14 @@ def causal_lm_bench_eval_callback_factory(trainer: Trainer, tokenizer):
         def __maybe_load_metrics(self):
             metrics = {}
             for metric in self.cfg.eval_causal_lm_metrics:
-                try:
-                    metrics[metric] = evaluate.load(metric)
-                except Exception as exc:  # pylint: disable=broad-exception-caught
-                    LOG.warning(f"{metric}: {exc.args}")
+                if metric == "perplexity":
+                    max_seq_len = self.cfg.eval_max_new_tokens
+                    metrics[metric] = Perplexity(trainer.model, tokenizer, max_seq_len)
+                else:
+                    try:
+                        metrics[metric] = evaluate.load(metric)
+                    except Exception as exc:  # pylint: disable=broad-exception-caught
+                        LOG.warning(f"{metric}: {exc.args}")
             return metrics
 
         def on_evaluate(
@@ -418,13 +427,20 @@ def causal_lm_bench_eval_callback_factory(trainer: Trainer, tokenizer):
                 # safely compute a metric and return the score if the format is correct
                 metric_score = None
                 try:
-                    metric_score = metric.compute(**kwargs)
+                    # Only pass the kwargs that are in the metric's feature list
+                    metric_kwargs = {
+                        k: kwargs[k]
+                        for k in metric._feature_names()  # pylint: disable=protected-access
+                        if k in kwargs
+                    }
+                    metric_score = metric.compute(**metric_kwargs)
                     return (
                         metric_score["score"]
                         if "score" in metric_score
                         else metric_score["mean_score"]
                     )
                 except Exception:  # pylint: disable=broad-exception-caught
+                    traceback.print_exc()
                     LOG.debug(
                         f"Failed to compute metric {metric.name} with kwargs {kwargs.keys()}"
                     )
@@ -440,11 +456,12 @@ def causal_lm_bench_eval_callback_factory(trainer: Trainer, tokenizer):
                         predictions=predictions,
                         sources=sources,
                     )
-                    score = score or compute(
-                        metric,
-                        references=[[r] for r in references],
-                        predictions=predictions,
-                    )
+                    if score is None:
+                        score = compute(
+                            metric,
+                            references=[[r] for r in references],
+                            predictions=predictions,
+                        )
                     scores[metric_name] = score
                 return scores
 
@@ -540,7 +557,7 @@ def causal_lm_bench_eval_callback_factory(trainer: Trainer, tokenizer):
     return CausalLMBenchEvalCallback
 
 
-def log_prediction_callback_factory(trainer: Trainer, tokenizer):
+def log_prediction_callback_factory(trainer: Trainer, tokenizer, logger: str):
     class LogPredictionCallback(TrainerCallback):
         """Callback to log prediction values during each evaluation"""
 
@@ -597,15 +614,13 @@ def log_prediction_callback_factory(trainer: Trainer, tokenizer):
                 return ranges
 
             def log_table_from_dataloader(name: str, table_dataloader):
-                table = wandb.Table(  # type: ignore[attr-defined]
-                    columns=[
-                        "id",
-                        "Prompt",
-                        "Correct Completion",
-                        "Predicted Completion (model.generate)",
-                        "Predicted Completion (trainer.prediction_step)",
-                    ]
-                )
+                table_data: Dict[str, List[Any]] = {
+                    "id": [],
+                    "Prompt": [],
+                    "Correct Completion": [],
+                    "Predicted Completion (model.generate)": [],
+                    "Predicted Completion (trainer.prediction_step)": [],
+                }
                 row_index = 0
 
                 for batch in tqdm(table_dataloader):
@@ -709,16 +724,29 @@ def log_prediction_callback_factory(trainer: Trainer, tokenizer):
                     ) in zip(
                         prompt_texts, completion_texts, predicted_texts, pred_step_texts
                     ):
-                        table.add_data(
-                            row_index,
-                            prompt_text,
-                            completion_text,
-                            prediction_text,
-                            pred_step_text,
+                        table_data["id"].append(row_index)
+                        table_data["Prompt"].append(prompt_text)
+                        table_data["Correct Completion"].append(completion_text)
+                        table_data["Predicted Completion (model.generate)"].append(
+                            prediction_text
                         )
+                        table_data[
+                            "Predicted Completion (trainer.prediction_step)"
+                        ].append(pred_step_text)
                         row_index += 1
+                if logger == "wandb":
+                    wandb.run.log({f"{name} - Predictions vs Ground Truth": pd.DataFrame(table_data)})  # type: ignore[attr-defined]
+                elif logger == "mlflow" and is_mlflow_available():
+                    import mlflow
 
-                wandb.run.log({f"{name} - Predictions vs Ground Truth": table})  # type: ignore[attr-defined]
+                    tracking_uri = AxolotlInputConfig(
+                        **self.cfg.to_dict()
+                    ).mlflow_tracking_uri
+                    mlflow.log_table(
+                        data=table_data,
+                        artifact_file="PredictionsVsGroundTruth.json",
+                        tracking_uri=tracking_uri,
+                    )
 
             if is_main_process():
                 log_table_from_dataloader("Eval", eval_dataloader)
@@ -748,10 +776,43 @@ class SaveAxolotlConfigtoWandBCallback(TrainerCallback):
                     mode="w", delete=False, suffix=".yml", prefix="axolotl_config_"
                 ) as temp_file:
                     copyfile(self.axolotl_config_path, temp_file.name)
+                    artifact = wandb.Artifact(
+                        f"config-{wandb.run.id}", type="axolotl-config"
+                    )
+                    artifact.add_file(temp_file.name)
+                    wandb.log_artifact(artifact)
                     wandb.save(temp_file.name)
                 LOG.info(
                     "The Axolotl config has been saved to the WandB run under files."
                 )
             except (FileNotFoundError, ConnectionError) as err:
                 LOG.warning(f"Error while saving Axolotl config to WandB: {err}")
+        return control
+
+
+class SaveModelCallback(TrainerCallback):
+    """Callback to save model on train end"""
+
+    def on_step_end(  # pylint: disable=unused-argument
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        **kwargs,
+    ):
+        # Save
+        if state.global_step >= state.max_steps:
+            control.should_save = True
+        elif (
+            args.save_strategy == IntervalStrategy.STEPS
+            and state.save_steps < 1.0
+            and state.global_step % math.ceil(state.save_steps * state.max_steps) == 0
+        ):
+            # workaround to save model on fractional save_steps
+            control.should_save = True
+
+    def on_train_end(  # pylint: disable=unused-argument
+        self, args, state, control, **kwargs
+    ):
+        control.should_save = True
         return control

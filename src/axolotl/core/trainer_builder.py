@@ -8,52 +8,63 @@ import importlib
 import importlib.util
 import logging
 import math
-import os
 import sys
 from abc import abstractmethod
+from collections import defaultdict
 from dataclasses import dataclass, field
 from functools import wraps
 from pathlib import Path
-from typing import List, Optional, Type, Union
+from typing import Dict, List, Literal, Optional, Type, Union
 
 import torch
 import transformers
-from accelerate import FullyShardedDataParallelPlugin
-from accelerate.utils import str_to_bool
 from datasets import Dataset
-from torch.distributed.fsdp import MixedPrecision
 from torch.optim.lr_scheduler import OneCycleLR
 from torch.utils.data import BatchSampler, DataLoader, RandomSampler, SequentialSampler
 from transformers import (
     EarlyStoppingCallback,
+    PreTrainedModel,
     Trainer,
     TrainerCallback,
     TrainingArguments,
 )
 from transformers.trainer_utils import seed_worker
 from transformers.utils import is_sagemaker_mp_enabled
-from trl import DPOTrainer
+from trl import (
+    CPOConfig,
+    CPOTrainer,
+    DPOConfig,
+    DPOTrainer,
+    KTOConfig,
+    KTOTrainer,
+    ORPOConfig,
+    ORPOTrainer,
+)
+from trl.trainer.utils import pad_to_length
 
-from axolotl.core.policies.auto_wrap import get_wrapping_policy_factory
 from axolotl.loraplus import create_loraplus_optimizer
 from axolotl.monkeypatch.multipack import SUPPORTED_MULTIPACK_MODEL_TYPES
 from axolotl.monkeypatch.relora import ReLoRACallback, ReLoRAScheduler
+from axolotl.utils import is_mlflow_available
 from axolotl.utils.callbacks import (
     EvalFirstStepCallback,
     GPUStatsCallback,
     LossWatchDogCallback,
     SaveAxolotlConfigtoWandBCallback,
     SaveBetterTransformerModelCallback,
+    SaveModelCallback,
     bench_eval_callback_factory,
     causal_lm_bench_eval_callback_factory,
     log_prediction_callback_factory,
 )
+from axolotl.utils.callbacks.lisa import lisa_callback_factory
 from axolotl.utils.collators import (
     BatchSamplerDataCollatorForSeq2Seq,
     DataCollatorForSeq2Seq,
     MambaDataCollator,
     V2BatchSamplerDataCollatorForSeq2Seq,
 )
+from axolotl.utils.models import ensure_dtype
 from axolotl.utils.samplers import MultipackBatchSampler, get_dataset_lengths
 from axolotl.utils.schedulers import (
     get_cosine_schedule_with_min_lr,
@@ -70,10 +81,6 @@ except ImportError:
     pass
 
 LOG = logging.getLogger("axolotl.core.trainer_builder")
-
-
-def is_mlflow_available():
-    return importlib.util.find_spec("mlflow") is not None
 
 
 def _sanitize_kwargs_for_tagging(tag_names, kwargs=None):
@@ -93,11 +100,12 @@ def _sanitize_kwargs_for_tagging(tag_names, kwargs=None):
 
 
 @dataclass
-class AxolotlTrainingArguments(TrainingArguments):
+class AxolotlTrainingMixins:
     """
-    Extend the base TrainingArguments for axolotl helpers
+    Mixin class for the Axolotl training args.
     """
 
+    # pylint: disable=duplicate-code
     model_type: Optional[str] = field(
         default=None, metadata={"help": "HF model configuration model_type."}
     )
@@ -127,13 +135,21 @@ class AxolotlTrainingArguments(TrainingArguments):
         default=1.0,
         metadata={"help": "Sample packing efficiency for calculating batch length."},
     )
+    sample_packing_bin_size: int = field(
+        default=200,
+        metadata={
+            "help": "The max number of samples that packed sample can contain after packing. Increase for better packing."
+        },
+    )
+    sample_packing_group_size: int = field(
+        default=100000,
+        metadata={
+            "help": "The number of samples to group together for packing. Increase for better packing."
+        },
+    )
     max_seq_length: int = field(
         default=2048,
         metadata={"help": "The maximum sequence length the model can handle"},
-    )
-    sample_packing_seq_len_multiplier: int = field(
-        default=1,
-        metadata={"help": "the multiplier for the max len for packed sequences"},
     )
     relora_steps: Optional[int] = field(
         default=None,
@@ -200,6 +216,74 @@ class AxolotlTrainingArguments(TrainingArguments):
         default=False,
         metadata={"help": "whether this is a qlora training"},
     )
+    orpo_alpha: Optional[float] = field(
+        default=None,
+    )
+    lisa_n_layers: Optional[int] = field(
+        default=None,
+        metadata={"help": "the number of activate layers in LISA"},
+    )
+    lisa_step_interval: Optional[int] = field(
+        default=None,
+        metadata={"help": "how often to switch layers in LISA"},
+    )
+    lisa_layers_attribute: Optional[str] = field(
+        default=None,
+        metadata={"help": "path under the model to access the layers"},
+    )
+    curriculum_sampling: Optional[bool] = field(
+        default=None,
+        metadata={"help": "whether to use sequential sampling for curriculum learning"},
+    )
+    alternate_optimizer: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "workaround to pass an alternate optimizer to the HF trainer"
+        },
+    )
+
+
+@dataclass
+class AxolotlTrainingArguments(AxolotlTrainingMixins, TrainingArguments):
+    """
+    Training arguments for Causal trainer
+
+    This code is duplicated due to HF TrainingArguments not setting output_dir with a defaujlt value
+    so it can't be used as a mixin.
+    """
+
+
+@dataclass
+class AxolotlDPOConfig(AxolotlTrainingMixins, DPOConfig):
+    """
+    DPO config for DPO training
+    """
+
+
+@dataclass
+class AxolotlORPOConfig(AxolotlTrainingMixins, ORPOConfig):
+    """
+    ORPO config for ORPO training
+    """
+
+
+@dataclass
+class AxolotlKTOConfig(AxolotlTrainingMixins, KTOConfig):
+    """
+    KTO config for KTO training
+    """
+
+
+@dataclass
+class AxolotlCPOConfig(AxolotlTrainingMixins, CPOConfig):
+    """
+    CPO config for CPO training
+    """
+
+    simpo_gamma: Optional[float] = field(
+        default=None,
+        metadata={"help": "simpo gamma parameter"},
+    )
 
 
 class AxolotlTrainer(Trainer):
@@ -216,33 +300,102 @@ class AxolotlTrainer(Trainer):
         num_epochs=1,
         bench_data_collator=None,
         eval_data_collator=None,
-        **kwargs
+        **kwargs,
     ):
         self.num_epochs = num_epochs
         self.bench_data_collator = bench_data_collator
         self.eval_data_collator = eval_data_collator
         super().__init__(*_args, **kwargs)
         self.train_data_collator = self.data_collator
+        self._stored_metrics = defaultdict(lambda: defaultdict(list))
+        if self.args.orpo_alpha:
+            self.loss_fct = torch.nn.CrossEntropyLoss(reduction="none")
+
+    def _wrap_model(self, model, training=True, dataloader=None):
+        if self.args.torch_compile:
+            torch._dynamo.config.accumulated_cache_size_limit = (  # pylint: disable=protected-access
+                256
+            )
+            model = torch.compile(
+                model,
+                backend=self.args.torch_compile_backend,
+                mode=self.args.torch_compile_mode,
+            )
+        return super()._wrap_model(model, training=training, dataloader=dataloader)
 
     def create_optimizer(self):
-        if self.args.loraplus_lr_ratio is None:
+        if (
+            self.args.loraplus_lr_ratio is None
+            and self.args.alternate_optimizer
+            not in ["optimi_adamw", "ao_adamw_8bit", "ao_adamw_4bit", "ao_adamw_fp8"]
+        ):
             return super().create_optimizer()
 
         opt_model = self.model_wrapped if is_sagemaker_mp_enabled() else self.model
         if self.optimizer is None:  # pylint: disable=access-member-before-definition
+            decay_parameters = self.get_decay_parameter_names(opt_model)
+            optimizer_grouped_parameters = [
+                {
+                    "params": [
+                        p
+                        for n, p in opt_model.named_parameters()
+                        if (n in decay_parameters and p.requires_grad)
+                    ],
+                    "weight_decay": self.args.weight_decay,
+                },
+                {
+                    "params": [
+                        p
+                        for n, p in opt_model.named_parameters()
+                        if (n not in decay_parameters and p.requires_grad)
+                    ],
+                    "weight_decay": 0.0,
+                },
+            ]
+
             optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(
                 self.args,
+                opt_model,
             )
 
-            loraplus_lr_ratio = getattr(self.args, "loraplus_lr_ratio", None)
-            loraplus_lr_embedding = getattr(self.args, "loraplus_lr_embedding", None)
-            self.optimizer = create_loraplus_optimizer(  # pylint: disable=attribute-defined-outside-init
-                opt_model,
-                optimizer_cls,
-                optimizer_kwargs,
-                loraplus_lr_ratio,
-                loraplus_lr_embedding,
-            )
+            if self.args.loraplus_lr_ratio is not None:
+                loraplus_lr_ratio = getattr(self.args, "loraplus_lr_ratio", None)
+                loraplus_lr_embedding = getattr(
+                    self.args, "loraplus_lr_embedding", None
+                )
+                self.optimizer = create_loraplus_optimizer(  # pylint: disable=attribute-defined-outside-init
+                    opt_model,
+                    optimizer_cls,
+                    optimizer_kwargs,
+                    loraplus_lr_ratio,
+                    loraplus_lr_embedding,
+                )
+            elif self.args.alternate_optimizer == "optimi_adamw":
+                from optimi import AdamW
+
+                self.optimizer = (  # pylint: disable=attribute-defined-outside-init
+                    AdamW(
+                        optimizer_grouped_parameters, foreach=False, **optimizer_kwargs
+                    )
+                )
+            elif self.args.alternate_optimizer == "ao_adamw_4bit":
+                from torchao.prototype.low_bit_optim import AdamW4bit
+
+                self.optimizer = (  # pylint: disable=attribute-defined-outside-init
+                    AdamW4bit(optimizer_grouped_parameters, **optimizer_kwargs)
+                )
+            elif self.args.alternate_optimizer == "ao_adamw_8bit":
+                from torchao.prototype.low_bit_optim import AdamW8bit
+
+                self.optimizer = (  # pylint: disable=attribute-defined-outside-init
+                    AdamW8bit(optimizer_grouped_parameters, **optimizer_kwargs)
+                )
+            elif self.args.alternate_optimizer == "ao_adamw_fp8":
+                from torchao.prototype.low_bit_optim import AdamWFp8
+
+                self.optimizer = (  # pylint: disable=attribute-defined-outside-init
+                    AdamWFp8(optimizer_grouped_parameters, **optimizer_kwargs)
+                )
 
         if is_sagemaker_mp_enabled():
             self.optimizer = smp.DistributedOptimizer(  # pylint: disable=attribute-defined-outside-init
@@ -325,12 +478,16 @@ class AxolotlTrainer(Trainer):
                 )
             return MultipackBatchSampler(
                 RandomSampler(self.train_dataset),
-                batch_size=batch_size,
-                drop_last=True,
-                batch_max_len=batch_max_len,
                 lengths=get_dataset_lengths(self.train_dataset),
                 packing_efficiency_estimate=self.args.sample_packing_efficiency,
+                batch_max_len=batch_max_len,
+                batch_size=batch_size,
+                group_size=self.args.sample_packing_group_size,
+                bin_size=self.args.sample_packing_bin_size,
+                drop_last=True,
             )
+        if self.args.curriculum_sampling:
+            return SequentialSampler(self.train_dataset)
         return super()._get_train_sampler()
 
     def _get_eval_sampler(
@@ -347,11 +504,13 @@ class AxolotlTrainer(Trainer):
                 )
             return MultipackBatchSampler(
                 SequentialSampler(eval_dataset),
-                batch_size=batch_size,
-                drop_last=True,
-                batch_max_len=batch_max_len,
-                lengths=get_dataset_lengths(eval_dataset),
+                lengths=get_dataset_lengths(self.eval_dataset),
                 packing_efficiency_estimate=self.args.sample_packing_efficiency,
+                batch_max_len=batch_max_len,
+                batch_size=batch_size,
+                group_size=self.args.sample_packing_group_size,
+                bin_size=self.args.sample_packing_bin_size,
+                drop_last=True,
             )
         return super()._get_eval_sampler(eval_dataset)
 
@@ -392,6 +551,8 @@ class AxolotlTrainer(Trainer):
             self.data_collator = (  # pylint: disable=attribute-defined-outside-init
                 self.eval_data_collator
             )
+            if eval_dataset:
+                eval_dataset = eval_dataset.remove_columns(["length"])
             dataloader = super().get_eval_dataloader(eval_dataset)
             self.data_collator = (  # pylint: disable=attribute-defined-outside-init
                 self.train_data_collator
@@ -465,7 +626,164 @@ class AxolotlTrainer(Trainer):
         #     outputs = model(**inputs)
         #     loss = trainer_weighted_loss(outputs, labels, shift_labels=True)
         #     return (loss, outputs) if return_outputs else loss
+        if self.args.orpo_alpha:
+            return self.orpo_compute_loss(model, inputs, return_outputs=return_outputs)
         return super().compute_loss(model, inputs, return_outputs=return_outputs)
+
+    @staticmethod
+    def orpo_concatenate_inputs(inputs, label_pad_token=-100, pad_token=0, device=None):
+        concatenated_batch = {}
+
+        max_length = max(
+            inputs["input_ids"].shape[1], inputs["rejected_input_ids"].shape[1]
+        )
+        # Concatenate positive and negative inputs
+        concatenated_batch["input_ids"] = pad_to_length(
+            inputs["input_ids"], max_length, pad_token
+        )
+        concatenated_batch["rejected_input_ids"] = pad_to_length(
+            inputs["rejected_input_ids"], max_length, pad_token
+        )
+        concatenated_batch["labels"] = pad_to_length(
+            inputs["labels"], max_length, label_pad_token
+        )
+        concatenated_batch["rejected_labels"] = pad_to_length(
+            inputs["rejected_labels"], max_length, label_pad_token
+        )
+        concatenated_batch["attention_mask"] = pad_to_length(
+            inputs["attention_mask"], max_length, 0
+        )
+        concatenated_batch["rejected_attention_mask"] = pad_to_length(
+            inputs["rejected_attention_mask"], max_length, 0
+        )
+        concatenated_batch["prompt_attention_mask"] = pad_to_length(
+            inputs["prompt_attention_mask"], max_length, 0
+        ).to(device=device)
+
+        input_ids = torch.cat(
+            [concatenated_batch["input_ids"], concatenated_batch["rejected_input_ids"]],
+            dim=0,
+        ).to(device=device)
+        attention_mask = torch.cat(
+            [
+                concatenated_batch["attention_mask"],
+                concatenated_batch["rejected_attention_mask"],
+            ],
+            dim=0,
+        ).to(device=device)
+        labels = torch.cat(
+            [concatenated_batch["labels"], concatenated_batch["rejected_labels"]], dim=0
+        ).to(device=device)
+
+        return {
+            "input_ids": input_ids,
+            "labels": labels,
+            "attention_mask": attention_mask,
+            "prompt_attention_mask": concatenated_batch["prompt_attention_mask"],
+        }
+
+    def orpo_compute_custom_loss(self, logits, labels):
+        logits = logits.contiguous()
+        loss = 0.0
+
+        if labels is not None:
+            # move labels to correct device to enable model parallelism
+            labels = labels.to(logits.device)
+            # Shift so that tokens < n predict n
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+
+            # Flatten the tokens
+            loss = self.loss_fct(shift_logits.transpose(2, 1), shift_labels).mean(
+                dim=-1
+            )
+
+        return loss
+
+    def orpo_compute_logps(
+        self, prompt_attention_mask, chosen_inputs, chosen_attention_mask, logits
+    ):
+        # Get the shape of chosen_attention_mask[:, :-1]
+        chosen_shape = chosen_attention_mask[:, :-1].shape
+
+        # Calculate the padding size
+        pad_length = chosen_shape[1] - (prompt_attention_mask.shape[1] - 1)
+
+        # Pad prompt_attention_mask with zeros to match the desired shape
+        prompt_attention_mask_padded = torch.nn.functional.pad(
+            prompt_attention_mask[:, 1:], (0, pad_length), mode="constant", value=0
+        )
+
+        # Perform the subtraction operation
+        mask = chosen_attention_mask[:, :-1] > prompt_attention_mask_padded
+
+        per_token_logps = torch.gather(
+            logits[:, :-1, :].log_softmax(-1),
+            dim=2,
+            index=(mask * chosen_inputs[:, 1:]).unsqueeze(2),
+        ).squeeze(2)
+        return torch.mul(per_token_logps, mask).sum(dim=1) / mask.sum(dim=1)
+
+    def orpo_compute_loss(self, model, inputs, return_outputs=False):
+        concat_inputs = AxolotlTrainer.orpo_concatenate_inputs(
+            inputs,
+            label_pad_token=-100,
+            pad_token=self.tokenizer.pad_token_id,
+            device=self.accelerator.device,
+        )
+
+        # Perform a single forward pass
+        outputs = model(
+            **{
+                "input_ids": concat_inputs["input_ids"],
+                "attention_mask": concat_inputs["attention_mask"],
+                "labels": concat_inputs["labels"],
+            },
+            output_hidden_states=True,
+        )
+
+        # Split the outputs for positive and negative examples
+        outputs_pos, outputs_neg = outputs.logits.chunk(2)
+
+        # Calculate NLL loss
+        pos_loss = self.orpo_compute_custom_loss(
+            logits=outputs_pos, labels=concat_inputs["input_ids"].chunk(2)[0]
+        )
+
+        # Calculate Log Probability
+        pos_prob = self.orpo_compute_logps(
+            prompt_attention_mask=concat_inputs["prompt_attention_mask"],
+            chosen_inputs=concat_inputs["input_ids"].chunk(2)[0],
+            chosen_attention_mask=concat_inputs["attention_mask"].chunk(2)[0],
+            logits=outputs_pos,
+        )
+        neg_prob = self.orpo_compute_logps(
+            prompt_attention_mask=concat_inputs["prompt_attention_mask"],
+            chosen_inputs=concat_inputs["input_ids"].chunk(2)[1],
+            chosen_attention_mask=concat_inputs["attention_mask"].chunk(2)[1],
+            logits=outputs_neg,
+        )
+
+        # Calculate log odds
+        log_odds = (pos_prob - neg_prob) - (
+            torch.log(1 - torch.exp(pos_prob)) - torch.log(1 - torch.exp(neg_prob))
+        )
+        sig_ratio = torch.nn.functional.sigmoid(log_odds)
+        ratio = torch.log(sig_ratio)
+
+        # Calculate the Final Loss
+        loss = torch.mean(pos_loss - self.args.orpo_alpha * ratio).to(
+            dtype=torch.bfloat16
+        )
+
+        metrics = {}
+        metrics["chosen_geometric_mean"] = torch.mean(pos_prob).cpu().item()
+        metrics["rejected_geometric_mean"] = torch.mean(neg_prob).cpu().item()
+        metrics["log_odds_ratio"] = torch.mean(ratio).cpu().item()
+        metrics["log_odds"] = torch.mean(log_odds).cpu().item()
+        self.store_metrics(metrics, train_eval="train")
+
+        return (loss, outputs_pos) if return_outputs else loss
 
     @wraps(Trainer.push_to_hub)
     def push_to_hub(self, *args, **kwargs) -> str:
@@ -479,53 +797,38 @@ class AxolotlTrainer(Trainer):
 
     @wraps(Trainer.create_accelerator_and_postprocess)
     def create_accelerator_and_postprocess(self):
-        rank = int(os.environ.get("LOCAL_RANK", 0))
         res = super().create_accelerator_and_postprocess()
 
-        if self.args.qlora is False:
-            return res
-
-        # the rest of this method override is specific to fsdp + qlora (for now)
-        sync_module_states = (
-            str_to_bool(os.environ.get("FSDP_SYNC_MODULE_STATES", "True")) == 1
-        )
-
-        mp_policy = None
-        amp = os.environ["ACCELERATE_MIXED_PRECISION"]
-        if amp == "fp16":
-            mp_policy = MixedPrecision(
-                param_dtype=torch.float32,
-                reduce_dtype=torch.float32,
-                buffer_dtype=torch.float32,
-            )
-        elif amp == "bf16":
-            mp_policy = MixedPrecision(
-                param_dtype=torch.float32,
-                reduce_dtype=torch.float32,
-                buffer_dtype=torch.float32,
-            )
-
-        # If somehow we figure out how we want to parameterize we want to autocast buffers...
-        # mp_policy = MixedPrecision(param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16, buffer_dtype=torch.float32)
-        # load_param_skip_names = ['inv_freq']
-
         if self.is_fsdp_enabled:
-            wrapping_policy = get_wrapping_policy_factory(self.args.model_type)
-            fsdp_plugin = FullyShardedDataParallelPlugin(
-                auto_wrap_policy=wrapping_policy(),
-                cpu_offload=False,
-                use_orig_params=False,
-                limit_all_gathers=True,
-                param_init_fn=lambda module: module.to_empty(
-                    device=torch.device("cuda"), recurse=False
-                )
-                if (rank != 0 and sync_module_states)
-                else None,
-                mixed_precision_policy=mp_policy,
-            )
-            self.accelerator.state.fsdp_plugin = fsdp_plugin
+            if (
+                "limit_all_gathers" in self.args.fsdp_config
+                and self.args.fsdp_config["limit_all_gathers"]
+            ):
+                self.accelerator.state.fsdp_plugin.limit_all_gathers = True
 
         return res
+
+    def log(self, logs: Dict[str, float]) -> None:
+        """
+        Log `logs` on the various objects watching training, including stored metrics.
+
+        Args:
+            logs (`Dict[str, float]`):
+                The values to log.
+        """
+        # logs either has 'loss' or 'eval_loss'
+        train_eval = "train" if "loss" in logs else "eval"
+        # Add averaged stored metrics to logs
+        for key, metrics in self._stored_metrics[train_eval].items():
+            logs[key] = torch.tensor(metrics).mean().item()
+        del self._stored_metrics[train_eval]
+        return super().log(logs)
+
+    def store_metrics(
+        self, metrics: Dict[str, float], train_eval: Literal["train", "eval"] = "train"
+    ) -> None:
+        for key, value in metrics.items():
+            self._stored_metrics[train_eval][key].append(value)
 
 
 class AxolotlMambaTrainer(AxolotlTrainer):
@@ -633,6 +936,40 @@ class AxolotlDPOTrainer(DPOTrainer):
 
     tag_names = ["axolotl", "dpo"]
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.optimizer = None
+
+    def create_optimizer(self):
+        if self.args.loraplus_lr_ratio is None:
+            return super().create_optimizer()
+
+        opt_model = self.model_wrapped if is_sagemaker_mp_enabled() else self.model
+        if self.optimizer is None:  # pylint: disable=access-member-before-definition
+            optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(
+                self.args,
+                opt_model,
+            )
+
+            loraplus_lr_ratio = getattr(self.args, "loraplus_lr_ratio", None)
+            if loraplus_lr_ratio:
+                print("Using lora+")
+            loraplus_lr_embedding = getattr(self.args, "loraplus_lr_embedding", None)
+            self.optimizer = create_loraplus_optimizer(  # pylint: disable=attribute-defined-outside-init
+                opt_model,
+                optimizer_cls,
+                optimizer_kwargs,
+                loraplus_lr_ratio,
+                loraplus_lr_embedding,
+            )
+
+        if is_sagemaker_mp_enabled():
+            self.optimizer = smp.DistributedOptimizer(  # pylint: disable=attribute-defined-outside-init
+                self.optimizer
+            )
+
+        return self.optimizer
+
     @wraps(DPOTrainer.push_to_hub)
     def push_to_hub(self, *args, **kwargs) -> str:
         """
@@ -642,6 +979,39 @@ class AxolotlDPOTrainer(DPOTrainer):
         kwargs = _sanitize_kwargs_for_tagging(tag_names=self.tag_names, kwargs=kwargs)
 
         return super().push_to_hub(*args, **kwargs)
+
+    def tokenize_row(
+        self, feature, model: Optional[Union[PreTrainedModel, torch.nn.Module]] = None
+    ) -> Dict:
+        res = super().tokenize_row(feature, model=model)
+        if self.tokenizer.bos_token_id is None and res["prompt_input_ids"][0] is None:
+            for key in res.keys():
+                res[key] = res[key][1:]
+        return res
+
+
+class AxolotlORPOTrainer(ORPOTrainer):
+    """
+    Extend the base ORPOTrainer for axolotl helpers
+    """
+
+    tag_names = ["axolotl", "orpo"]
+
+
+class AxolotlKTOTrainer(KTOTrainer):
+    """
+    Extend the base KTOTrainer for axolotl helpers
+    """
+
+    tag_names = ["axolotl", "kto"]
+
+
+class AxolotlCPOTrainer(CPOTrainer):
+    """
+    Extend the base CPOTrainer for axolotl helpers
+    """
+
+    tag_names = ["axolotl", "cpo"]
 
 
 class TrainerBuilderBase(abc.ABC):
@@ -658,6 +1028,12 @@ class TrainerBuilderBase(abc.ABC):
         self.cfg = cfg
         self.model = model
         self.tokenizer = tokenizer
+
+        # in case the model supports tagging, add the axolotl tag.
+        # This makes sure the tag is correctly pushed even if a user calls
+        # model.push_to_hub instad of  trainer.push_to_hub.
+        if hasattr(model, "add_model_tags"):
+            model.add_model_tags(["axolotl"])
 
     @property
     def model_ref(self):
@@ -700,6 +1076,14 @@ class TrainerBuilderBase(abc.ABC):
         if self.cfg.use_wandb:
             callbacks.append(
                 SaveAxolotlConfigtoWandBCallback(self.cfg.axolotl_config_path)
+            )
+        if self.cfg.use_mlflow and is_mlflow_available():
+            from axolotl.utils.callbacks.mlflow_ import (
+                SaveAxolotlConfigtoMlflowCallback,
+            )
+
+            callbacks.append(
+                SaveAxolotlConfigtoMlflowCallback(self.cfg.axolotl_config_path)
             )
 
         return callbacks
@@ -746,21 +1130,10 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
         ):
             callbacks.append(SaveBetterTransformerModelCallback())
 
-        if self.cfg.use_wandb:
-            callbacks.append(
-                SaveAxolotlConfigtoWandBCallback(self.cfg.axolotl_config_path)
-            )
-        if self.cfg.use_mlflow and is_mlflow_available():
-            from axolotl.utils.callbacks.mlflow_ import (
-                SaveAxolotlConfigtoMlflowCallback,
-            )
-
-            callbacks.append(
-                SaveAxolotlConfigtoMlflowCallback(self.cfg.axolotl_config_path)
-            )
-
         if self.cfg.loss_watchdog_threshold is not None:
             callbacks.append(LossWatchDogCallback(self.cfg))
+
+        callbacks.append(SaveModelCallback())
 
         return callbacks
 
@@ -768,7 +1141,16 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
         callbacks = []
         if self.cfg.use_wandb and self.cfg.eval_table_size > 0:
             LogPredictionCallback = log_prediction_callback_factory(
-                trainer, self.tokenizer
+                trainer, self.tokenizer, "wandb"
+            )
+            callbacks.append(LogPredictionCallback(self.cfg))
+        if (
+            self.cfg.use_mlflow
+            and is_mlflow_available()
+            and self.cfg.eval_table_size > 0
+        ):
+            LogPredictionCallback = log_prediction_callback_factory(
+                trainer, self.tokenizer, "mlflow"
             )
             callbacks.append(LogPredictionCallback(self.cfg))
 
@@ -786,6 +1168,8 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
             )
             callbacks.append(early_stop_cb)
 
+        if self.cfg.lisa_step_interval and self.cfg.lisa_n_layers:
+            callbacks.append(lisa_callback_factory(trainer))
         return callbacks
 
     def _get_trainer_cls(self):
@@ -807,6 +1191,8 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
             warmup_steps = max(int(self.cfg.warmup_ratio * total_num_steps), 0)
         else:
             warmup_steps = min(int(0.03 * total_num_steps), 100)
+        if warmup_steps == 1:
+            warmup_steps = 2
 
         logging_steps = (
             self.cfg.logging_steps
@@ -837,10 +1223,6 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
                 training_arguments_kwargs[
                     "gradient_checkpointing_kwargs"
                 ] = self.cfg.gradient_checkpointing_kwargs
-            else:
-                training_arguments_kwargs["gradient_checkpointing_kwargs"] = {
-                    "use_reentrant": False
-                }
         if self.cfg.fsdp:
             training_arguments_kwargs["fsdp"] = self.cfg.fsdp
             if self.cfg.fsdp_config:
@@ -879,11 +1261,6 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
         if self.cfg.save_safetensors is not None:
             training_arguments_kwargs["save_safetensors"] = self.cfg.save_safetensors
 
-        if self.cfg.sample_packing_eff_est:
-            training_arguments_kwargs[
-                "sample_packing_efficiency"
-            ] = self.cfg.sample_packing_eff_est
-
         if self.cfg.dataloader_pin_memory is not None:
             training_arguments_kwargs[
                 "dataloader_pin_memory"
@@ -902,6 +1279,11 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
             ] = self.cfg.dataloader_drop_last
         elif self.cfg.sample_packing and self.cfg.eval_sample_packing is False:
             training_arguments_kwargs["dataloader_drop_last"] = True
+
+        if self.cfg.remove_unused_columns is not None:
+            training_arguments_kwargs[
+                "remove_unused_columns"
+            ] = self.cfg.remove_unused_columns
 
         if not self.cfg.test_datasets and self.cfg.val_set_size == 0:
             # no eval set, so don't eval
@@ -925,6 +1307,8 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
         else:
             # default to saving each epoch if not defined
             training_arguments_kwargs["save_strategy"] = "epoch"
+
+        training_arguments_kwargs["save_only_model"] = self.cfg.save_only_model
 
         if self.cfg.do_bench_eval:
             training_arguments_kwargs["do_bench_eval"] = self.cfg.do_bench_eval
@@ -951,6 +1335,10 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
                     training_arguments_kwargs[
                         "torch_compile_backend"
                     ] = self.cfg.torch_compile_backend
+                if self.cfg.torch_compile_mode:
+                    training_arguments_kwargs[
+                        "torch_compile_mode"
+                    ] = self.cfg.torch_compile_mode
 
         # DDP Config
         if self.cfg.ddp_timeout:
@@ -1004,11 +1392,15 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
             False if self.cfg.ddp else None
         )
         training_arguments_kwargs["group_by_length"] = self.cfg.group_by_length
-        report_to = None
+        training_arguments_kwargs["curriculum_sampling"] = self.cfg.curriculum_sampling
+        report_to = []
         if self.cfg.use_wandb:
-            report_to = "wandb"
+            report_to.append("wandb")
         if self.cfg.use_mlflow:
-            report_to = "mlflow"
+            report_to.append("mlflow")
+        if self.cfg.use_tensorboard:
+            report_to.append("tensorboard")
+
         training_arguments_kwargs["report_to"] = report_to
         training_arguments_kwargs["run_name"] = (
             self.cfg.wandb_name if self.cfg.use_wandb else None
@@ -1016,6 +1408,18 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
         training_arguments_kwargs["optim"] = (
             self.cfg.optimizer if self.cfg.optimizer else "adamw_hf"
         )
+        if self.cfg.optim_args:
+            if isinstance(self.cfg.optim_args, dict):
+                optim_args = ",".join(
+                    [f"{key}={value}" for key, value in self.cfg.optim_args.items()]
+                )
+            else:
+                optim_args = self.cfg.optim_args
+            training_arguments_kwargs["optim_args"] = optim_args
+        if self.cfg.optim_target_modules:
+            training_arguments_kwargs[
+                "optim_target_modules"
+            ] = self.cfg.optim_target_modules
         training_arguments_kwargs["loraplus_lr_ratio"] = self.cfg.loraplus_lr_ratio
         training_arguments_kwargs[
             "loraplus_lr_embedding"
@@ -1036,20 +1440,27 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
         training_arguments_kwargs["weight_decay"] = (
             self.cfg.weight_decay if self.cfg.weight_decay is not None else 0.0
         )
-        training_arguments_kwargs["sample_packing"] = (
-            self.cfg.sample_packing if self.cfg.sample_packing else False
-        )
-        training_arguments_kwargs["multipack_real_batches"] = (
-            self.cfg.flash_attention is not True
-        )
-        training_arguments_kwargs["eval_sample_packing"] = (
-            self.cfg.sample_packing
-            if self.cfg.eval_sample_packing is not False
-            else False
-        )
+
+        training_arguments_kwargs["sample_packing"] = bool(self.cfg.sample_packing)
         training_arguments_kwargs[
-            "sample_packing_seq_len_multiplier"
-        ] = self.cfg.micro_batch_size
+            "multipack_real_batches"
+        ] = not self.cfg.flash_attention
+        training_arguments_kwargs["eval_sample_packing"] = bool(
+            self.cfg.eval_sample_packing
+        )
+        if self.cfg.sample_packing_bin_size is not None:
+            training_arguments_kwargs[
+                "sample_packing_bin_size"
+            ] = self.cfg.sample_packing_bin_size
+        if self.cfg.sample_packing_group_size is not None:
+            training_arguments_kwargs[
+                "sample_packing_group_size"
+            ] = self.cfg.sample_packing_group_size
+        if self.cfg.sample_packing_eff_est:
+            training_arguments_kwargs[
+                "sample_packing_efficiency"
+            ] = self.cfg.sample_packing_eff_est
+
         if self.cfg.relora_steps:
             training_arguments_kwargs["relora_steps"] = self.cfg.relora_steps
             training_arguments_kwargs[
@@ -1064,11 +1475,23 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
                     "relora_prune_ratio"
                 ] = self.cfg.relora_prune_ratio
 
+        if self.cfg.lisa_step_interval and self.cfg.lisa_n_layers:
+            training_arguments_kwargs["lisa_n_layers"] = self.cfg.lisa_n_layers
+            training_arguments_kwargs[
+                "lisa_step_interval"
+            ] = self.cfg.lisa_step_interval
+            training_arguments_kwargs[
+                "lisa_layers_attribute"
+            ] = self.cfg.lisa_layers_attribute
+
         training_arguments_kwargs = self.hook_pre_create_training_args(
             training_arguments_kwargs
         )
         training_arguments_kwargs["model_type"] = self.cfg.model_config_type
         training_arguments_kwargs["pretraining"] = bool(self.cfg.pretraining_dataset)
+
+        if self.cfg.rl == "orpo":
+            training_arguments_kwargs["orpo_alpha"] = self.cfg.orpo_alpha
 
         if self.cfg.neftune_noise_alpha is not None:
             training_arguments_kwargs[
@@ -1076,6 +1499,16 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
             ] = self.cfg.neftune_noise_alpha
 
         trainer_kwargs = {}
+
+        if self.cfg.optimizer in [
+            "optimi_adamw",
+            "ao_adamw_4bit",
+            "ao_adamw_8bit",
+            "ao_adamw_fp8",
+        ]:
+            # Set default so transformers doesn't throw
+            training_arguments_kwargs["optim"] = "adamw_hf"
+            training_arguments_kwargs["alternate_optimizer"] = self.cfg.optimizer
 
         if self.cfg.optimizer == "lion_pytorch":
             from lion_pytorch import Lion
@@ -1105,6 +1538,11 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
                 sys.path.append(self.cfg.torchdistx_path)
                 importlib.import_module("torchdistx")
 
+        if self.cfg.accelerator_config:
+            training_arguments_kwargs[
+                "accelerator_config"
+            ] = self.cfg.accelerator_config
+
         training_args = (
             AxolotlTrainingArguments(  # pylint: disable=unexpected-keyword-arg
                 **training_arguments_kwargs,
@@ -1133,6 +1571,7 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
             train_dataset=self.train_dataset,
             eval_dataset=self.eval_dataset,
             args=training_args,
+            tokenizer=self.tokenizer,
             data_collator=self.build_collator(training_args, **data_collator_kwargs),
             eval_data_collator=self.build_collator(
                 training_args, is_eval=True, **data_collator_kwargs
@@ -1199,13 +1638,15 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
         )
 
 
-class HFDPOTrainerBuilder(TrainerBuilderBase):
+class HFRLTrainerBuilder(TrainerBuilderBase):
     """
     Trainer factory class for DPO Trainer
     """
 
     def get_callbacks(self):
         callbacks = super().get_callbacks()
+        callbacks.append(SaveModelCallback())
+
         return callbacks
 
     def get_post_trainer_create_callbacks(self, trainer):
@@ -1241,9 +1682,12 @@ class HFDPOTrainerBuilder(TrainerBuilderBase):
             training_args_kwargs["eval_steps"] = self.cfg.eval_steps
         else:
             training_args_kwargs["evaluation_strategy"] = "no"
+
         if self.cfg.bf16 or self.cfg.bfloat16:
             training_args_kwargs["bf16"] = True
 
+        training_args_kwargs["loraplus_lr_ratio"] = self.cfg.loraplus_lr_ratio
+        training_args_kwargs["loraplus_lr_embedding"] = self.cfg.loraplus_lr_embedding
         training_args_kwargs["lr_scheduler_type"] = (
             self.cfg.lr_scheduler if self.cfg.lr_scheduler else "cosine"
         )
@@ -1292,12 +1736,51 @@ class HFDPOTrainerBuilder(TrainerBuilderBase):
             # default to saving each epoch if not defined
             training_args_kwargs["save_strategy"] = "epoch"
 
-        training_args = TrainingArguments(
+        if self.cfg.rl_beta:
+            training_args_kwargs["beta"] = self.cfg.rl_beta
+        if self.cfg.orpo_alpha:
+            # trl does some odd mapping of alpha to beta to reuse the beta parameter ???
+            training_args_kwargs["beta"] = self.cfg.orpo_alpha
+
+        training_args_kwargs["dataset_num_proc"] = self.cfg.dataset_processes
+        training_args_cls = AxolotlDPOConfig
+        if self.cfg.rpo_alpha is not None:
+            training_args_kwargs["rpo_alpha"] = self.cfg.rpo_alpha
+
+        if self.cfg.rl == "simpo":
+            training_args_cls = AxolotlCPOConfig
+            training_args_kwargs["loss_type"] = "simpo"
+            training_args_kwargs["simpo_gamma"] = self.cfg.simpo_gamma
+            if self.cfg.cpo_alpha is not None:
+                training_args_kwargs["cpo_alpha"] = self.cfg.cpo_alpha
+
+        if self.cfg.rl == "orpo":
+            training_args_cls = AxolotlORPOConfig
+            training_args_kwargs["max_length"] = self.cfg.sequence_len
+            if self.cfg.max_prompt_len:
+                training_args_kwargs["max_prompt_length"] = self.cfg.max_prompt_len
+
+        if self.cfg.rl == "kto":
+            training_args_cls = AxolotlKTOConfig
+
+            training_args_kwargs["desirable_weight"] = (
+                self.cfg.kto_desirable_weight or 1.0
+            )
+            training_args_kwargs["undesirable_weight"] = (
+                self.cfg.kto_undesirable_weight or 1.0
+            )
+
+            training_args_kwargs["dataset_num_proc"] = self.cfg.dataset_processes
+            training_args_kwargs["max_length"] = self.cfg.sequence_len
+            if self.cfg.max_prompt_len:
+                training_args_kwargs["max_prompt_length"] = self.cfg.max_prompt_len
+
+        training_args = training_args_cls(  # pylint: disable=unexpected-keyword-arg
+            output_dir=self.cfg.output_dir,
             per_device_train_batch_size=self.cfg.micro_batch_size,
             max_steps=self.cfg.max_steps or total_num_steps,
             gradient_accumulation_steps=self.cfg.gradient_accumulation_steps,
             learning_rate=self.cfg.learning_rate,
-            output_dir=self.cfg.output_dir,
             warmup_steps=self.cfg.warmup_steps,
             logging_first_step=True,
             logging_steps=1,
@@ -1315,8 +1798,6 @@ class HFDPOTrainerBuilder(TrainerBuilderBase):
             dpo_trainer_kwargs["loss_type"] = "ipo"
             if self.cfg.dpo_label_smoothing:
                 dpo_trainer_kwargs["label_smoothing"] = self.cfg.dpo_label_smoothing
-        elif self.cfg.rl == "kto_pair":
-            dpo_trainer_kwargs["loss_type"] = "kto_pair"
         if self.eval_dataset:
             dpo_trainer_kwargs["eval_dataset"] = self.eval_dataset
         if self.cfg.adapter and self.peft_config:
@@ -1325,20 +1806,37 @@ class HFDPOTrainerBuilder(TrainerBuilderBase):
             dpo_trainer_kwargs[
                 "precompute_ref_log_probs"
             ] = self.cfg.precompute_ref_log_probs
-        dpo_trainer = AxolotlDPOTrainer(
-            self.model,
-            self.model_ref,
+        if self.cfg.rl in ["dpo", "ipo"]:
+            trainer_cls = AxolotlDPOTrainer
+            trainer_cls_args = [self.model, self.model_ref]
+
+            # these aren't used for the ORPO trainer
+            dpo_trainer_kwargs["max_length"] = self.cfg.sequence_len
+            dpo_trainer_kwargs["max_target_length"] = None
+            dpo_trainer_kwargs["max_prompt_length"] = self.cfg.sequence_len
+            dpo_trainer_kwargs["generate_during_eval"] = True
+        elif self.cfg.rl == "orpo":
+            trainer_cls = AxolotlORPOTrainer
+            trainer_cls_args = [self.model]
+        elif self.cfg.rl in ["kto"]:
+            trainer_cls = AxolotlKTOTrainer
+            trainer_cls_args = [self.model]
+        elif self.cfg.rl in ["simpo"]:
+            trainer_cls = AxolotlCPOTrainer
+            trainer_cls_args = [self.model]
+        else:
+            raise ValueError(f"Unsupported RL: {self.cfg.rl}")
+        dpo_trainer = trainer_cls(
+            *trainer_cls_args,
             args=training_args,
-            beta=self.cfg.dpo_beta or 0.1,
             train_dataset=self.train_dataset,
             tokenizer=self.tokenizer,
-            max_length=self.cfg.sequence_len,
-            max_target_length=None,
-            max_prompt_length=self.cfg.sequence_len,
-            generate_during_eval=True,
             callbacks=self.get_callbacks(),
             **dpo_trainer_kwargs,
         )
+        if self.cfg.fsdp:
+            ensure_dtype(dpo_trainer.model, dtype=self.cfg.torch_dtype)
+
         dpo_trainer = self.hook_post_create_trainer(dpo_trainer)
         for callback in self.get_post_trainer_create_callbacks(dpo_trainer):
             dpo_trainer.add_callback(callback)

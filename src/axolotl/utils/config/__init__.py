@@ -10,6 +10,7 @@ from transformers.utils import is_torch_bf16_gpu_available
 
 from axolotl.utils.bench import log_gpu_memory_usage
 from axolotl.utils.config.models.input.v0_4_1 import (
+    SUPPORTED_METRICS,
     AxolotlConfigWCapabilities,
     AxolotlInputConfig,
 )
@@ -119,6 +120,10 @@ def normalize_config(cfg):
     model_config = load_model_config(cfg)
     cfg.model_config_type = model_config.model_type
 
+    cfg.tokenizer_config = (
+        cfg.tokenizer_config or cfg.base_model_config or cfg.base_model
+    )
+
     # figure out if the model is llama
     cfg.is_llama_derived_model = (
         (hasattr(model_config, "model_type") and model_config.model_type == "llama")
@@ -183,14 +188,22 @@ def normalize_cfg_datasets(cfg):
     helpers for mapping chat_template to various dataset configurations as necessary
     """
 
-    if cfg.chat_template and cfg.chat_template == "chatml":
+    if cfg.chat_template:
         if cfg.datasets:
             for idx, ds_cfg in enumerate(cfg.datasets):
                 if ds_cfg.type == "sharegpt" and not ds_cfg.conversation:
                     LOG.info(
-                        f"updating dataset {ds_cfg.path} with `conversation: chatml` to match your chat_template"
+                        f"updating dataset {ds_cfg.path} with `conversation: {cfg.chat_template}` to match your chat_template"
                     )
-                    cfg.datasets[idx].conversation = "chatml"
+                    cfg.datasets[idx].conversation = cfg.chat_template
+                if (
+                    ds_cfg.type in ["orpo.chat_template", "chat_template"]
+                    and not ds_cfg.chat_template
+                ):
+                    LOG.info(
+                        f"updating dataset {ds_cfg.path} with `chat_template: {cfg.chat_template}` to match your chat_template"
+                    )
+                    cfg.datasets[idx].chat_template = cfg.chat_template
 
 
 def validate_config(cfg: DictDefault, capabilities: Optional[dict] = None):
@@ -199,11 +212,11 @@ def validate_config(cfg: DictDefault, capabilities: Optional[dict] = None):
             dict(
                 AxolotlConfigWCapabilities(
                     **cfg.to_dict(), capabilities=capabilities
-                ).model_dump(exclude_unset=True)
+                ).model_dump(exclude_none=True)
             )
         )
     return DictDefault(
-        dict(AxolotlInputConfig(**cfg.to_dict()).model_dump(exclude_unset=True))
+        dict(AxolotlInputConfig(**cfg.to_dict()).model_dump(exclude_none=True))
     )
 
 
@@ -374,9 +387,9 @@ def legacy_validate_config(cfg):
             "push_to_hub_model_id is deprecated. Please use hub_model_id instead."
         )
 
-    if cfg.hub_model_id and not (cfg.save_steps or cfg.saves_per_epoch):
+    if cfg.hub_model_id and cfg.save_strategy not in ["steps", "epoch", None]:
         LOG.warning(
-            "hub_model_id is set without any models being saved. To save a model, set either save_steps or saves_per_epoch."
+            "hub_model_id is set without any models being saved. To save a model, set save_strategy to steps, epochs or leave empty."
         )
 
     if cfg.gptq and cfg.revision_of_model:
@@ -439,9 +452,13 @@ def legacy_validate_config(cfg):
         raise ValueError(
             "save_steps and saves_per_epoch are mutually exclusive and cannot be used together."
         )
-    if cfg.saves_per_epoch and cfg.save_strategy and cfg.save_strategy != "steps":
+    if cfg.save_strategy and cfg.saves_per_epoch and cfg.save_strategy != "steps":
         raise ValueError(
             "save_strategy must be empty or set to `steps` when used with saves_per_epoch."
+        )
+    if cfg.save_strategy and cfg.save_steps and cfg.save_strategy != "steps":
+        raise ValueError(
+            "save_strategy and save_steps mismatch. Please set save_strategy to 'steps' or remove save_steps."
         )
     if cfg.evals_per_epoch and cfg.eval_steps:
         raise ValueError(
@@ -455,11 +472,6 @@ def legacy_validate_config(cfg):
         raise ValueError(
             "evaluation_strategy must be empty or set to `steps` when used with evals_per_epoch."
         )
-    if cfg.save_strategy and cfg.save_steps and cfg.save_strategy != "steps":
-        raise ValueError(
-            "save_strategy and save_steps mismatch. Please set save_strategy to 'steps' or remove save_steps."
-        )
-
     if (
         cfg.evaluation_strategy
         and cfg.eval_steps
@@ -575,13 +587,12 @@ def legacy_validate_config(cfg):
         )
 
     if cfg.eval_causal_lm_metrics:
-        supported_metrics = ["sacrebleu", "comet", "ter", "chrf"]
         if not isinstance(cfg.eval_causal_lm_metrics, list):
             raise ValueError("eval_causal_lm_metrics must be a list")
         # only ["sacrebleu", "comet", "ter", "chrf"] supported
-        if set(cfg.eval_causal_lm_metrics) - set(supported_metrics):
+        if set(cfg.eval_causal_lm_metrics) - SUPPORTED_METRICS:
             raise ValueError(
-                f"eval_causal_lm_metrics must be one of {supported_metrics}"
+                f"eval_causal_lm_metrics must be one of {SUPPORTED_METRICS}"
             )
 
     # TODO
